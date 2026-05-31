@@ -415,17 +415,26 @@ def f4_kernel_L2(
     s1_im = s1_im.to(tl.float16)
 
     k1 = out_digit
-    y_nat = k1[None, :] * 16 + k2[:, None]
-    y_mask = (sig1[:, None] < B) & (k1[None, :] >= 0)
     if STORE_T:
-        outer = sig1 // M
-        inner = sig1 - outer * M
-        y_offsets = outer[:, None] * 256 * M + y_nat * M + inner[:, None]
-    else:
-        y_offsets = sig1[:, None] * 256 + y_nat
+        sig = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+        outer = sig // M
+        inner = sig - outer * M
+        y_idx = tl.arange(0, 256)
+        y_offsets = outer[None, :] * 256 * M + y_idx[:, None] * M + inner[None, :]
+        y_mask_t = (y_idx[:, None] >= 0) & (sig[None, :] < B)
 
-    tl.store(y_re_ptr + y_offsets, s1_re, mask=y_mask)
-    tl.store(y_im_ptr + y_offsets, s1_im, mask=y_mask)
+        s1_re_3d = tl.reshape(s1_re, (BLOCK_B, 16, 16))
+        s1_im_3d = tl.reshape(s1_im, (BLOCK_B, 16, 16))
+        store_re = tl.reshape(tl.permute(s1_re_3d, (2, 1, 0)), (256, BLOCK_B))
+        store_im = tl.reshape(tl.permute(s1_im_3d, (2, 1, 0)), (256, BLOCK_B))
+        tl.store(y_re_ptr + y_offsets, store_re, mask=y_mask_t)
+        tl.store(y_im_ptr + y_offsets, store_im, mask=y_mask_t)
+    else:
+        y_nat = k1[None, :] * 16 + k2[:, None]
+        y_mask = (sig1[:, None] < B) & (k1[None, :] >= 0)
+        y_offsets = sig1[:, None] * 256 + y_nat
+        tl.store(y_re_ptr + y_offsets, s1_re, mask=y_mask)
+        tl.store(y_im_ptr + y_offsets, s1_im, mask=y_mask)
 
 
 # =============================================================================
@@ -468,16 +477,18 @@ def dft_kernel(
     y_re = y_re.to(tl.float16)
     y_im = y_im.to(tl.float16)
 
-    y_mask = (row[:, None] < rows) & (out[None, :] < R)
     if STORE_T:
         outer = row // M
         inner = row - outer * M
-        y_offsets = outer[:, None] * R * M + out[None, :] * M + inner[:, None]
+        y_offsets = outer[None, :] * R * M + out[:, None] * M + inner[None, :]
+        y_mask_t = (row[None, :] < rows) & (out[:, None] < R)
+        tl.store(y_re_ptr + y_offsets, tl.trans(y_re), mask=y_mask_t)
+        tl.store(y_im_ptr + y_offsets, tl.trans(y_im), mask=y_mask_t)
     else:
+        y_mask = (row[:, None] < rows) & (out[None, :] < R)
         y_offsets = row[:, None] * R + out[None, :]
-
-    tl.store(y_re_ptr + y_offsets, y_re, mask=y_mask)
-    tl.store(y_im_ptr + y_offsets, y_im, mask=y_mask)
+        tl.store(y_re_ptr + y_offsets, y_re, mask=y_mask)
+        tl.store(y_im_ptr + y_offsets, y_im, mask=y_mask)
 
 
 # =============================================================================
@@ -522,12 +533,14 @@ def bailey_scale_kernel(
     y_im = (x_re * tw_im + x_im * tw_re).to(tl.float16)
 
     if STORE_T:
-        y_offsets = row * M * m0 + kM[None, :] * m0 + n1[:, None]
+        y_offsets = row * M * m0 + kM[:, None] * m0 + n1[None, :]
+        mask_t = (kM[:, None] < M) & (n1[None, :] < m0)
+        tl.store(y_re_ptr + y_offsets, tl.trans(y_re), mask=mask_t)
+        tl.store(y_im_ptr + y_offsets, tl.trans(y_im), mask=mask_t)
     else:
         y_offsets = x_offsets
-
-    tl.store(y_re_ptr + y_offsets, y_re, mask=mask)
-    tl.store(y_im_ptr + y_offsets, y_im, mask=mask)
+        tl.store(y_re_ptr + y_offsets, y_re, mask=mask)
+        tl.store(y_im_ptr + y_offsets, y_im, mask=mask)
 
 
 # =============================================================================
