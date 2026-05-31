@@ -50,7 +50,11 @@ def _cdot(a_re, a_im, b_re, b_im):
 
     TODO: implement.
     """
-    pass
+    rr = tl.dot(a_re, b_re, out_dtype=tl.float32)
+    ii = tl.dot(a_im, b_im, out_dtype=tl.float32)
+    ri = tl.dot(a_re, b_im, out_dtype=tl.float32)
+    ir = tl.dot(a_im, b_re, out_dtype=tl.float32)
+    return rr - ii, ri + ir
 
 
 # =============================================================================
@@ -68,7 +72,16 @@ def f6_factor(N: int) -> list[int]:
         65536 -> [256, 256]         1048576 -> [256, 256, 16]
         64 -> [16, 4]               2 -> [2]
     """
-    raise NotImplementedError("TODO: implement f6_factor")
+    assert N >= 2 and (N & (N - 1)) == 0, f"N must be a power of 2 >= 2; got {N}"
+    k = N.bit_length() - 1
+    n256, rem = divmod(k, 8)
+    n16, rem = divmod(rem, 4)
+    small = 1 << rem
+    chunks = [256] * n256 + [16] * n16
+    if small > 1:
+        chunks.append(small)
+    assert math.prod(chunks) == N
+    return chunks
 
 
 f7_factor = f6_factor   # F7 reuses F6's chunk recipe
@@ -104,7 +117,37 @@ def f1_kernel(
 
     TODO: implement.
     """
-    pass
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc_re = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_im = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+
+        x_mask = (offs_b[:, None] < B) & (k[None, :] < N)
+        x_offsets = offs_b[:, None] * N + k[None, :]
+        x_re = tl.load(x_re_ptr + x_offsets, mask=x_mask, other=0.0)
+        x_im = tl.load(x_im_ptr + x_offsets, mask=x_mask, other=0.0)
+
+        w_mask = (k[:, None] < N) & (offs_n[None, :] < N)
+        w_offsets = offs_n[None, :] * N + k[:, None]
+        w_re = tl.load(W_re_ptr + w_offsets, mask=w_mask, other=0.0)
+        w_im = tl.load(W_im_ptr + w_offsets, mask=w_mask, other=0.0)
+
+        dot_re, dot_im = _cdot(x_re, x_im, w_re, w_im)
+        acc_re += dot_re
+        acc_im += dot_im
+
+    y_mask = (offs_b[:, None] < B) & (offs_n[None, :] < N)
+    y_offsets = offs_b[:, None] * N + offs_n[None, :]
+    tl.store(y_re_ptr + y_offsets, acc_re, mask=y_mask)
+    tl.store(y_im_ptr + y_offsets, acc_im, mask=y_mask)
 
 
 def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
@@ -114,7 +157,17 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f1_launch")
+    B, N = x_re.shape
+    BLOCK_M = 16
+    BLOCK_N = 16
+    BLOCK_K = 32
+    grid = (triton.cdiv(B, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    f1_kernel[grid](
+        x_re, x_im, W_re, W_im, y_re, y_im,
+        B, N,
+        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+        num_warps=4, num_stages=3,
+    )
 
 
 # =============================================================================
@@ -154,7 +207,55 @@ def f2_kernel(
 
     TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    offs = tl.arange(0, N)
+
+    perm = tl.load(perm_ptr + offs)
+    base = pid * N
+    v_re = tl.load(x_re_ptr + base + perm)
+    v_im = tl.load(x_im_ptr + base + perm)
+
+    for s in tl.static_range(0, LOG2_N):
+        half = 1 << s
+        partner = offs ^ half
+        p_re = tl.gather(v_re, partner, axis=0)
+        p_im = tl.gather(v_im, partner, axis=0)
+
+        tw_idx = (offs & (half - 1)) * (N >> (s + 1))
+        w_re = tl.load(tw_re_ptr + tw_idx)
+        w_im = tl.load(tw_im_ptr + tw_idx)
+
+        is_upper = (offs & half) != 0
+        lo_re = tl.where(is_upper, p_re, v_re)
+        lo_im = tl.where(is_upper, p_im, v_im)
+        hi_re = tl.where(is_upper, v_re, p_re)
+        hi_im = tl.where(is_upper, v_im, p_im)
+
+        t_re = w_re * hi_re - w_im * hi_im
+        t_im = w_re * hi_im + w_im * hi_re
+        v_re = tl.where(is_upper, lo_re - t_re, lo_re + t_re)
+        v_im = tl.where(is_upper, lo_im - t_im, lo_im + t_im)
+
+    if BAILEY_EPILOGUE:
+        outer_idx = pid % OUTER_DIM
+        bt_offs = outer_idx * N + offs
+        b_re = tl.load(bt_re_ptr + bt_offs)
+        b_im = tl.load(bt_im_ptr + bt_offs)
+        out_re = v_re * b_re - v_im * b_im
+        out_im = v_re * b_im + v_im * b_re
+    else:
+        out_re = v_re
+        out_im = v_im
+
+    if STRIDED_STORE:
+        outer_idx = pid % OUTER_DIM
+        batch_idx = pid // OUTER_DIM
+        y_offsets = batch_idx * N_TOTAL + offs * OUTER_DIM + outer_idx
+    else:
+        y_offsets = base + offs
+
+    tl.store(y_re_ptr + y_offsets, out_re)
+    tl.store(y_im_ptr + y_offsets, out_im)
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
@@ -162,7 +263,17 @@ def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f2_launch")
+    B, N = x_re.shape
+    assert N >= 2 and (N & (N - 1)) == 0, f"N must be a power of 2 >= 2; got {N}"
+    f2_kernel[(B,)](
+        x_re, x_im, y_re, y_im,
+        tw_re, tw_im, perm,
+        tw_re, tw_im,
+        1, 0,
+        N=N, LOG2_N=int(math.log2(N)),
+        BAILEY_EPILOGUE=False, STRIDED_STORE=False,
+        num_warps=8,
+    )
 
 
 # =============================================================================
@@ -182,7 +293,22 @@ def transpose_kernel(
 
     TODO: implement.
     """
-    pass
+    pid_r = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask = (offs_r[:, None] < R) & (offs_c[None, :] < C)
+
+    batch_base = pid_b * R * C
+    x_offsets = batch_base + offs_r[:, None] * C + offs_c[None, :]
+    y_offsets = batch_base + offs_c[None, :] * R + offs_r[:, None]
+
+    tile_re = tl.load(x_re_ptr + x_offsets, mask=mask, other=0.0)
+    tile_im = tl.load(x_im_ptr + x_offsets, mask=mask, other=0.0)
+    tl.store(y_re_ptr + y_offsets, tile_re, mask=mask)
+    tl.store(y_im_ptr + y_offsets, tile_im, mask=mask)
 
 
 # =============================================================================
@@ -235,7 +361,71 @@ def f4_kernel_L2(
 
     TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    local_rows = tl.arange(0, BLOCK_B * 16)
+    d0 = tl.arange(0, 16)
+    out_digit = tl.arange(0, 16)
+
+    sig0 = pid * BLOCK_B + (local_rows // 16)
+    d1 = local_rows % 16
+
+    x_offsets = sig0[:, None] * 256 + d0[None, :] * 16 + d1[:, None]
+    x_mask = (sig0[:, None] < B) & (d0[None, :] >= 0)
+    x_re = tl.load(x_re_ptr + x_offsets, mask=x_mask, other=0.0)
+    x_im = tl.load(x_im_ptr + x_offsets, mask=x_mask, other=0.0)
+
+    f_offsets = out_digit[None, :] * 16 + d0[:, None]
+    f_re_t = tl.load(F_re_ptr + f_offsets)
+    f_im_t = tl.load(F_im_ptr + f_offsets)
+
+    s0_re, s0_im = _cdot(x_re, x_im, f_re_t, f_im_t)
+    s0_re = s0_re.to(tl.float16)
+    s0_im = s0_im.to(tl.float16)
+
+    if STAGE_STOP == 1:
+        k2 = out_digit
+        y_nat = k2[None, :] * 16 + d1[:, None]
+        if STORE_T:
+            outer = sig0 // M
+            inner = sig0 - outer * M
+            y_offsets = outer[:, None] * 256 * M + y_nat * M + inner[:, None]
+        else:
+            y_offsets = sig0[:, None] * 256 + y_nat
+        tl.store(y_re_ptr + y_offsets, s0_re, mask=x_mask)
+        tl.store(y_im_ptr + y_offsets, s0_im, mask=x_mask)
+        return
+
+    s0_re_3d = tl.reshape(s0_re, (BLOCK_B, 16, 16))
+    s0_im_3d = tl.reshape(s0_im, (BLOCK_B, 16, 16))
+    a1_re = tl.reshape(tl.permute(s0_re_3d, (0, 2, 1)), (BLOCK_B * 16, 16))
+    a1_im = tl.reshape(tl.permute(s0_im_3d, (0, 2, 1)), (BLOCK_B * 16, 16))
+
+    sig1 = pid * BLOCK_B + (local_rows // 16)
+    k2 = local_rows % 16
+    tw_m = tl.arange(0, 16)
+    tw_offsets = 16 * 16 + tw_m[None, :] * 16 + k2[:, None]
+    tw_re = tl.load(tw_re_ptr + tw_offsets)
+    tw_im = tl.load(tw_im_ptr + tw_offsets)
+
+    a1_tw_re = (a1_re * tw_re - a1_im * tw_im).to(tl.float16)
+    a1_tw_im = (a1_re * tw_im + a1_im * tw_re).to(tl.float16)
+
+    s1_re, s1_im = _cdot(a1_tw_re, a1_tw_im, f_re_t, f_im_t)
+    s1_re = s1_re.to(tl.float16)
+    s1_im = s1_im.to(tl.float16)
+
+    k1 = out_digit
+    y_nat = k1[None, :] * 16 + k2[:, None]
+    y_mask = (sig1[:, None] < B) & (k1[None, :] >= 0)
+    if STORE_T:
+        outer = sig1 // M
+        inner = sig1 - outer * M
+        y_offsets = outer[:, None] * 256 * M + y_nat * M + inner[:, None]
+    else:
+        y_offsets = sig1[:, None] * 256 + y_nat
+
+    tl.store(y_re_ptr + y_offsets, s1_re, mask=y_mask)
+    tl.store(y_im_ptr + y_offsets, s1_im, mask=y_mask)
 
 
 # =============================================================================
@@ -260,7 +450,34 @@ def dft_kernel(
 
     TODO: implement.
     """
-    pass
+    pid = tl.program_id(0)
+    row = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    k = tl.arange(0, 16)
+    out = tl.arange(0, 16)
+
+    x_offsets = row[:, None] * R + k[None, :]
+    x_mask = (row[:, None] < rows) & (k[None, :] < R)
+    x_re = tl.load(x_re_ptr + x_offsets, mask=x_mask, other=0.0)
+    x_im = tl.load(x_im_ptr + x_offsets, mask=x_mask, other=0.0)
+
+    mt_offsets = out[None, :] * 16 + k[:, None]
+    mt_re = tl.load(M_re_ptr + mt_offsets)
+    mt_im = tl.load(M_im_ptr + mt_offsets)
+
+    y_re, y_im = _cdot(x_re, x_im, mt_re, mt_im)
+    y_re = y_re.to(tl.float16)
+    y_im = y_im.to(tl.float16)
+
+    y_mask = (row[:, None] < rows) & (out[None, :] < R)
+    if STORE_T:
+        outer = row // M
+        inner = row - outer * M
+        y_offsets = outer[:, None] * R * M + out[None, :] * M + inner[:, None]
+    else:
+        y_offsets = row[:, None] * R + out[None, :]
+
+    tl.store(y_re_ptr + y_offsets, y_re, mask=y_mask)
+    tl.store(y_im_ptr + y_offsets, y_im, mask=y_mask)
 
 
 # =============================================================================
@@ -285,7 +502,32 @@ def bailey_scale_kernel(
 
     TODO: implement.
     """
-    pass
+    pid_m0 = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    row = tl.program_id(2)
+
+    n1 = pid_m0 * BLOCK_M0 + tl.arange(0, BLOCK_M0)
+    kM = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = (n1[:, None] < m0) & (kM[None, :] < M)
+
+    x_offsets = row * m0 * M + n1[:, None] * M + kM[None, :]
+    tw_offsets = n1[:, None] * M + kM[None, :]
+
+    x_re = tl.load(x_re_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+    x_im = tl.load(x_im_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+    tw_re = tl.load(tw_re_ptr + tw_offsets, mask=mask, other=0.0).to(tl.float32)
+    tw_im = tl.load(tw_im_ptr + tw_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    y_re = (x_re * tw_re - x_im * tw_im).to(tl.float16)
+    y_im = (x_re * tw_im + x_im * tw_re).to(tl.float16)
+
+    if STORE_T:
+        y_offsets = row * M * m0 + kM[None, :] * m0 + n1[:, None]
+    else:
+        y_offsets = x_offsets
+
+    tl.store(y_re_ptr + y_offsets, y_re, mask=mask)
+    tl.store(y_im_ptr + y_offsets, y_im, mask=mask)
 
 
 # =============================================================================
@@ -363,7 +605,33 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f3_launch")
+    N1 = plan['N1']
+    N2 = plan['N2']
+    N = plan['N']
+
+    _transpose(in_re, in_im, mid_re, mid_im, B, N2, N1)
+
+    f2_kernel[(B * N1,)](
+        mid_re, mid_im, out_re, out_im,
+        plan['tw_re_n2'], plan['tw_im_n2'], plan['perm_n2'],
+        plan['bt_re'], plan['bt_im'],
+        N1, N,
+        N=N2, LOG2_N=plan['LOG2_N2'],
+        BAILEY_EPILOGUE=True, STRIDED_STORE=False,
+        num_warps=8,
+    )
+
+    _transpose(out_re, out_im, mid_re, mid_im, B, N1, N2)
+
+    f2_kernel[(B * N2,)](
+        mid_re, mid_im, out_re, out_im,
+        plan['tw_re_n1'], plan['tw_im_n1'], plan['perm_n1'],
+        plan['tw_re_n1'], plan['tw_im_n1'],
+        N2, N,
+        N=N1, LOG2_N=plan['LOG2_N1'],
+        BAILEY_EPILOGUE=False, STRIDED_STORE=True,
+        num_warps=8,
+    )
 
 
 # =============================================================================
@@ -387,7 +655,15 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f5_launch")
+    N1 = plan['N1']
+    N2 = plan['N2']
+
+    _transpose(in_re, in_im, b0_re, b0_im, B, N2, N1)
+    _fft_chunk(b0_re, b0_im, b1_re, b1_im, B * N1, N2, plan)
+    _scale(b1_re, b1_im, b0_re, b0_im, B, N1, N2, plan['bt_re'], plan['bt_im'])
+    _transpose(b0_re, b0_im, b1_re, b1_im, B, N1, N2)
+    _fft_chunk(b1_re, b1_im, b2_re, b2_im, B * N2, N1, plan)
+    _transpose(b2_re, b2_im, b0_re, b0_im, B, N2, N1)
 
 
 # =============================================================================
@@ -410,7 +686,33 @@ def _f6_rec(cur_re, cur_im, rows, chunks, plan, cyc):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement _f6_rec")
+    m0 = chunks[0]
+    if len(chunks) == 1:
+        out_re, out_im = cyc.next()
+        _fft_chunk(cur_re, cur_im, out_re, out_im, rows, m0, plan)
+        return out_re, out_im
+
+    M = math.prod(chunks[1:])
+    N_i = m0 * M
+
+    t1_re, t1_im = cyc.next()
+    _transpose(cur_re, cur_im, t1_re, t1_im, rows, M, m0)
+
+    rec_re, rec_im = _f6_rec(t1_re, t1_im, rows * m0, chunks[1:], plan, cyc)
+
+    tw_re, tw_im = _lookup_tw(plan, m0, M, N_i)
+    scaled_re, scaled_im = cyc.next()
+    _scale(rec_re, rec_im, scaled_re, scaled_im, rows, m0, M, tw_re, tw_im)
+
+    t2_re, t2_im = cyc.next()
+    _transpose(scaled_re, scaled_im, t2_re, t2_im, rows, m0, M)
+
+    fft_re, fft_im = cyc.next()
+    _fft_chunk(t2_re, t2_im, fft_re, fft_im, rows * M, m0, plan)
+
+    out_re, out_im = cyc.next()
+    _transpose(fft_re, fft_im, out_re, out_im, rows, M, m0)
+    return out_re, out_im
 
 
 def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
@@ -420,4 +722,24 @@ def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement _f7_rec")
+    m0 = chunks[0]
+    if len(chunks) == 1:
+        out_re, out_im = cyc.next()
+        _fft_chunk(cur_re, cur_im, out_re, out_im, rows, m0, plan)
+        return out_re, out_im
+
+    M = math.prod(chunks[1:])
+    N_i = m0 * M
+
+    t1_re, t1_im = cyc.next()
+    _transpose(cur_re, cur_im, t1_re, t1_im, rows, M, m0)
+
+    rec_re, rec_im = _f7_rec(t1_re, t1_im, rows * m0, chunks[1:], plan, cyc)
+
+    tw_re, tw_im = _lookup_tw(plan, m0, M, N_i)
+    t2_re, t2_im = cyc.next()
+    _scale(rec_re, rec_im, t2_re, t2_im, rows, m0, M, tw_re, tw_im, store_t=True)
+
+    out_re, out_im = cyc.next()
+    _fft_chunk(t2_re, t2_im, out_re, out_im, rows * M, m0, plan, M=M, store_t=True)
+    return out_re, out_im

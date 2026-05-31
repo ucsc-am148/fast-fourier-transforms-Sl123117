@@ -33,7 +33,9 @@ def make_radix2_twiddles(
     Used by the radix-2 butterfly: stage s reads twiddle at index
     (k & (2**s - 1)) * (N >> (s+1)), so the table only needs the lower half
     of one full period."""
-    raise NotImplementedError("TODO: implement make_radix2_twiddles")
+    k = torch.arange(N // 2, dtype=torch.float64, device=device)
+    angle = -2.0 * math.pi * k / N
+    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
 
 
 # =============================================================================
@@ -79,7 +81,46 @@ def make_radix16_twiddles(
     where e_{L-1-j}_value(c) reads the base-16 digit of c at the position
     given by _column_axis_labeling(L)[s].
     """
-    raise NotImplementedError("TODO: implement make_radix16_twiddles")
+    if N < 16:
+        raise ValueError(f"N must be at least 16, got {N}")
+
+    L = 0
+    tmp = N
+    while tmp > 1:
+        if tmp % 16 != 0:
+            raise ValueError(f"N must be a power of 16, got {N}")
+        tmp //= 16
+        L += 1
+
+    cols = N // 16
+    tw_re = torch.empty((L, 16, cols), dtype=torch.float16, device=device)
+    tw_im = torch.empty((L, 16, cols), dtype=torch.float16, device=device)
+
+    c = torch.arange(cols, dtype=torch.int64, device=device)
+    m = torch.arange(16, dtype=torch.float64, device=device)[:, None]
+
+    for s, labels in enumerate(_column_axis_labeling(L)):
+        if s == 0:
+            tw_re[s].fill_(1.0)
+            tw_im[s].zero_()
+            continue
+
+        t = torch.zeros((cols,), dtype=torch.float64, device=device)
+        for axis_pos, label in enumerate(labels):
+            if label[0] != 'e':
+                continue
+            j = L - 1 - label[1]
+            if j >= s:
+                continue
+            shift = 16 ** (L - 2 - axis_pos)
+            digit = ((c // shift) % 16).to(torch.float64)
+            t = t + digit * (16 ** j)
+
+        angle = -2.0 * math.pi * m * t[None, :] / (16 ** (s + 1))
+        tw_re[s] = torch.cos(angle).to(torch.float16)
+        tw_im[s] = torch.sin(angle).to(torch.float16)
+
+    return tw_re, tw_im
 
 
 # =============================================================================
@@ -100,7 +141,10 @@ def make_bailey_cross_twiddles(
     F5/F6/F7 call it with dtype=torch.float16 (the tcFFT tier is fp16). The
     Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
     """
-    raise NotImplementedError("TODO: implement make_bailey_cross_twiddles")
+    n1 = torch.arange(m0, dtype=torch.float64, device=device)[:, None]
+    kM = torch.arange(M, dtype=torch.float64, device=device)[None, :]
+    angle = -2.0 * math.pi * n1 * kM / N
+    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
 
 
 # =============================================================================
@@ -116,7 +160,10 @@ def make_dft_matrix(
 
     W[j, k] = exp(-2*pi*i * j * k / N). Used by F1 (DFT-as-complex-matmul).
     """
-    raise NotImplementedError("TODO: implement make_dft_matrix")
+    j = torch.arange(N, dtype=torch.float64, device=device)[:, None]
+    k = torch.arange(N, dtype=torch.float64, device=device)[None, :]
+    angle = -2.0 * math.pi * j * k / N
+    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
 
 
 def make_dft_R_padded(
@@ -129,7 +176,19 @@ def make_dft_R_padded(
     first R columns are F_R (rows wrap mod R), take the first R output rows.
     This makes the >=16x16 tl.dot requirement hold for all R in {2, 4, 8, 16}.
     """
-    raise NotImplementedError("TODO: implement make_dft_R_padded")
+    if R not in (2, 4, 8, 16):
+        raise ValueError(f"R must be one of {{2, 4, 8, 16}}, got {R}")
+
+    rows = (torch.arange(16, dtype=torch.float64, device=device) % R)[:, None]
+    cols = torch.arange(16, dtype=torch.float64, device=device)[None, :]
+    angle = -2.0 * math.pi * rows * cols / R
+
+    re = torch.cos(angle)
+    im = torch.sin(angle)
+    col_mask = cols < R
+    re = torch.where(col_mask, re, torch.zeros_like(re))
+    im = torch.where(col_mask, im, torch.zeros_like(im))
+    return re.to(torch.float16), im.to(torch.float16)
 
 
 def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
@@ -138,4 +197,16 @@ def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
     rev[i] is the integer whose n_bits=log2(N) binary representation is i's
     bits in reversed order.
     """
-    raise NotImplementedError("TODO: implement bit_reversal_perm")
+    n_bits = int(math.log2(N))
+    if 1 << n_bits != N:
+        raise ValueError(f"N must be a power of 2, got {N}")
+
+    rev = []
+    for i in range(N):
+        r = 0
+        x = i
+        for _ in range(n_bits):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        rev.append(r)
+    return torch.tensor(rev, dtype=torch.int32, device=device)
